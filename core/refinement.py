@@ -160,8 +160,10 @@ def get_encoding(activations, relevance_scores, mode = "pca", linear = False, ce
         return encoder.eval(), decoder.eval(), mean
     
     
-def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_transforms = None, standardize = False, layer_spatial = None, use_rel = False, slack = 0.05, handle_neg_rel = None):
-    
+def refine_EGEM_w_tuning(model, activations, relevance_scores, eval_loader, layer_transforms = None, standardize = False, layer_spatial = None, use_rel = False, slack = 0.05, handle_neg_rel = None):
+    '''
+    Takes a model, activations, and relevance-scores
+    '''
     for layer in layer_transforms:
         transform = layer_transforms[layer]
         if transform not in ["pca", "prca", ""]:
@@ -195,8 +197,8 @@ def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_tr
         
         if transform != "":
             
-            if explanations is not None:
-                exp = explanations[layer]
+            if relevance_scores is not None:
+                exp = relevance_scores[layer]
             else:
                 exp = None
             
@@ -225,7 +227,7 @@ def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_tr
 
                 decoded = decoder(h)
                 
-                A, = torch.autograd.grad(decoded, h, grad_outputs=torch.tensor(explanations[layer]).float())
+                A, = torch.autograd.grad(decoded, h, grad_outputs=torch.tensor(relevance_scores[layer]).float())
                 
                 handle.remove()
                 A = A.detach().numpy()
@@ -243,7 +245,7 @@ def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_tr
 
         else:
             if use_rel:
-                A = explanations[layer]
+                A = relevance_scores[layer]
             else:
                 A = activations[layer]
 
