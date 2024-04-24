@@ -8,6 +8,12 @@ def get_scaling_factors(E, lmbda):
 
 class Refined_Module_EGEM(torch.nn.Module):
 
+    '''
+    A module that acts as a wrapper around a given layer. During
+    the forward pass, input is scaled by pre-computed scaling factors. 
+    Subsequently, the original layer is applied.
+    
+    '''
     def __init__(self, module, scaling, linear = False):
         super().__init__()
 
@@ -26,7 +32,11 @@ class Refined_Module_EGEM(torch.nn.Module):
         return self.module.__str__()
 
 class Refined_Module_Multitransform(torch.nn.Module):
-
+    '''
+    A wrapper module that applies the pruning in a space induced by some invertible function. 
+    Multiple transform/scaling operations can be performed during the forward pass. 
+    
+    '''
     def __init__(self, module, encoders, decoders, means, scalings):
 
         super().__init__()
@@ -57,12 +67,21 @@ class Refined_Module_Multitransform(torch.nn.Module):
     def __str__(self):
         return self.module.__str__()
     
-def get_encoding(activations, explanations, mode = "pca", linear = False, center = True, standardize = False, eps = 10**-30):
-
+def get_encoding(activations, relevance_scores, mode = "pca", linear = False, center = True, standardize = False, eps = 10**-30):
+    
+    '''
+    This function computes principle (relevant) components
+    from activations and relevance scores of a given layer.  
+    Components are returned either as a 1x1 convolutional module or 
+    a linear module, where weights correspond to component values.
+    
+    '''
     if mode not in ["pca", "prca"]:
         raise ValueError(f"Unknown mode {mode}")
     
     if mode == "pca":
+
+        # For convolutional layers, every spatial dimension is seen as an individual datapoint
         if not linear:
             A_flat = torch.tensor(activations.swapaxes(1, 3))
             A_flat = torch.flatten(A_flat, 0, 2).numpy()
@@ -79,6 +98,7 @@ def get_encoding(activations, explanations, mode = "pca", linear = False, center
             A_flat = A_flat / std
             std = torch.tensor(std).float()
 
+        # Compute empirical covariance matrix
         cov = A_flat.T @ A_flat / len(A_flat)
         eigv, transform = np.linalg.eigh(cov)
         inv = transform.T
@@ -97,16 +117,18 @@ def get_encoding(activations, explanations, mode = "pca", linear = False, center
             A_flat = torch.tensor(activations.swapaxes(1, 3))
             A_flat = torch.flatten(A_flat, 0, 2).numpy()
         
-            Exp_flat = torch.tensor(explanations.swapaxes(1, 3))
+            rel_flat = torch.tensor(relevance_scores.swapaxes(1, 3))
 
-            Exp_flat = torch.flatten(Exp_flat, 0, 2).numpy()
+            rel_flat = torch.flatten(rel_flat, 0, 2).numpy()
 
         else:
             A_flat = activations.copy()
-            Exp_flat = explanations.copy()
+            rel_flat = relevance_scores.copy()
 
-        ctx = Exp_flat / (A_flat + eps)
+        # Get context vectors
+        ctx = rel_flat / (A_flat + eps)
         
+        # Compute Sigma
         cov = (A_flat.T @ ctx + ctx.T @ A_flat) / len(A_flat)
 
         eigv, transform = np.linalg.eigh(cov)
@@ -116,6 +138,7 @@ def get_encoding(activations, explanations, mode = "pca", linear = False, center
         if not linear:
             mean = mean[None, :, None, None]
 
+    # Return components in form of PyTorch modules to be applicable during the forward pass
     if not linear:
         encoder = torch.nn.Conv2d(transform.shape[0], transform.shape[0], 1, bias = False)
         encoder.weight = torch.nn.Parameter(torch.tensor(transform.T[:, :, None, None]).float())
@@ -137,14 +160,14 @@ def get_encoding(activations, explanations, mode = "pca", linear = False, center
         return encoder.eval(), decoder.eval(), mean
     
     
-def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_transforms = None, standardize = False, layer_spatial = None, use_expl = False, slack = 0.05, handle_neg_rel = None):
+def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_transforms = None, standardize = False, layer_spatial = None, use_rel = False, slack = 0.05, handle_neg_rel = None):
     
     for layer in layer_transforms:
         transform = layer_transforms[layer]
         if transform not in ["pca", "prca", ""]:
             raise ValueError(f"unknown transform: {transform}")
     
-    if use_expl and standardize:
+    if use_rel and standardize:
         raise ValueError(f"standardizing only supported for activation criterion")
     
     if handle_neg_rel not in [None, "abs", "cut", "square"]:
@@ -177,6 +200,7 @@ def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_tr
             else:
                 exp = None
             
+            # Get transform into subspace in which to perform the pruning
             ret = get_encoding(activations[layer], exp, linear = linear, mode = transform, standardize=standardize)
             
             if standardize:
@@ -186,9 +210,12 @@ def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_tr
                 encoder, decoder, mean = ret
                 std = None
 
+            if use_rel:
 
-            if use_expl:
-            
+                # If the relevance criterion is used for pruning (i.e. EGEM-R), we need to
+                # attribute onto concepts (activations projected onto the subspace).
+                # We could use PRCA eigenvalues for this, but it would not be exact for convolutional
+                # layers.
                 h = encoder(torch.tensor(activations[layer]).float()).detach()
 
                 rule = zennit.rules.Epsilon()
@@ -215,7 +242,7 @@ def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_tr
                 std = std.cuda()                
 
         else:
-            if use_expl:
+            if use_rel:
                 A = explanations[layer]
             else:
                 A = activations[layer]
@@ -225,6 +252,7 @@ def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_tr
         if not linear and not spatial:
             A = A.sum(axis = (2,3))
 
+        # Insert virtual layer into the network
         if transform == "":        
             R[layer] = refined_mod
             setattr(model, layer.name, refined_mod)
@@ -242,11 +270,11 @@ def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_tr
             setattr(model, layer.name, refined_mod)
             R[layer] = refined_mod
         
-        if transform == "prca" and use_expl and handle_neg_rel == "cut":
+        if transform == "prca" and use_rel and handle_neg_rel == "cut":
             A[A < 0] = 0
             E[layer] = A.mean(axis = 0)
 
-        if transform == "prca" and use_expl and handle_neg_rel == "abs":
+        if transform == "prca" and use_rel and handle_neg_rel == "abs":
             A = np.abs(A)
             E[layer] = A.mean(axis = 0)
         
@@ -265,6 +293,7 @@ def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_tr
     lmbdas = {}
     # τl = 1 − (1 − α) * (l − 1) / (L − 1)
 
+    # Perform exponential search for lambda, given desired average pruning strengths alpha
     for a in alphas:
 
         scalings[a] = {}
@@ -278,7 +307,6 @@ def refine_EGEM_w_tuning(model, activations, explanations, eval_loader, layer_tr
             print(t)
 
         base = 1.1
-        print(t)
 
         for i, layer in enumerate(layers):
 
