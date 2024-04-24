@@ -4,5 +4,5 @@ This repository contains scripts and utilities that were used during the experim
 
 - Core/data.py provides datasets and utilities for the three datasets used during our experiments, consisting of training-, refinement-, and evaluation-data.
 
-- Core/model.py contains the simple CNN implementation in PyTorch. 
+- Core/model.py contains the simple CNN's implementation in PyTorch. 
 
