@@ -2,72 +2,244 @@ import numpy as np
 import utils
 import torch
 import zennit
+from typing import override
+from abc import ABC, abstractmethod
 
 def get_scaling_factors(E, lmbda):
     return E / (E + lmbda)
+
+class Invertible_Transform(ABC):
+    @abstractmethod
+    def fit(self, A, R):
+        '''Fit transform from activations and relevance scores'''
+
+    def finalize_fit(self):
+        self.fitted = True
+
+    def encode(self, x):
+        return self.encoder(x)
+    
+    def decode(self, x):
+        return self.decoder(x)
+
+class Orthogonal_Transform(Invertible_Transform):
+
+    def make_modules(self, matrix, as_1x1_conv):
+
+        d = matrix.shape[0]
+        
+        if as_1x1_conv:
+            self.encoder = torch.nn.Conv2d(d, d, 1, bias = False)
+            self.encoder.weight = torch.nn.Parameter(torch.tensor(matrix.T[:, :, None, None]).float())
+            self.decoder = torch.nn.Conv2d(d, d, 1, bias = False)
+            self.decoder.weight = torch.nn.Parameter(torch.tensor(matrix[:, :, None, None]).float())
+        else:
+            self.encoder = torch.nn.Linear(d, d, bias = False)
+            self.encoder.weight = torch.nn.Parameter(torch.tensor(matrix.T).float())
+            self.decoder = torch.nn.Linear(d, d, bias = False)
+            self.decoder.weight = torch.nn.Parameter(torch.tensor(matrix).float())
+
+class PRCA(Orthogonal_Transform):
+    
+    def __init__(self, stabilizer = 10**-6, as_1x1_conv = False):
+        self.as_1x1_conv = as_1x1_conv
+        self.stabilizer = stabilizer
+
+    @override
+    def fit(self, A, R):
+
+        if A.shape != R.shape:
+            raise ValueError(f"A must be of same shape as R")
+        
+        if len(A.shape) not in [2, 4]:
+            raise ValueError(f"invalid shape ({A.shape})")
+        
+        linear = len(A.shape) == 2
+        
+        # For convolutional layers, every spatial dimension is seen as an individual datapoint
+        if not linear:
+            A_flat = torch.tensor(A.swapaxes(1, 3))
+            A_flat = torch.flatten(A_flat, 0, 2).numpy()
+            R_flat = torch.tensor(R.swapaxes(1, 3))
+            R_flat = torch.flatten(R_flat, 0, 2).numpy()
+        else:
+            A_flat = A.copy()
+            R_flat = R.copy()
+
+        sign = A_flat / np.absolute(A_flat)
+
+        # Get context vectors
+        ctx = R_flat / (A_flat + self.stabilizer * sign)
+        
+        # Compute Cross-Covariance matrix
+        cov = (A_flat.T @ ctx + ctx.T @ A_flat) / len(A_flat)
+
+        _, components = np.linalg.eigh(cov)
+
+        self.make_modules(components, self.as_1x1_conv)
+        self.finalize_fit()
+    
+class PCA(Orthogonal_Transform):
+
+    def __init__(self, center = True, as_1x1_conv = False):
+
+        self.center = center
+        self.as_1x1_conv = as_1x1_conv
+
+    @override
+    def encode(self, x):
+        if self.mean is not None:
+            x -= self.mean
+        return self.encoder(x)
+    
+    @override
+    def decode(self, x):
+        x = self.decoder(x)
+        if self.mean is not None:
+            x += self.mean
+        return x
+    
+    @override
+    def fit(self, A, R):
+        if len(A.shape) not in [2, 4]:
+            raise ValueError(f"invalid shape ({A.shape})")
+        
+        linear = len(A.shape) == 2
+        
+        # For convolutional layers, every spatial dimension is seen as an individual datapoint
+        if not linear:
+            X_flat = torch.tensor(A.swapaxes(1, 3))
+            X_flat = torch.flatten(X_flat, 0, 2).numpy()
+        else:
+            X_flat = A.copy()
+        
+        if self.center:
+            mean = X_flat.mean(axis = 0)
+            X_flat -= mean
+            
+            self.mean = torch.tensor(mean).float()
+            
+            if self.as_1x1_conv:
+                self.mean = self.mean[None,:, None, None]
+        else:
+            self.mean = None
+
+        # Compute empirical covariance matrix
+        cov = X_flat.T @ X_flat / len(X_flat)
+        _, components = np.linalg.eigh(cov)
+
+        self.make_modules(components, self.as_1x1_conv)
+        self.finalize_fit()
+
+class Refinement_Hook:
+
+    def __init__(self, scaling, transform = None, inverse = None):
+
+        self.scaling = scaling
+        self.transform = transform
+        self.inverse = inverse
+    
+    def hook(self, module, input, output):
+
+        if self.transform is not None:
+            output = self.transform(output)
+
+        output = output * self.scaling
+
+        if self.inverse is not None:
+            output = self.inverse(output)
+
+        return output
+
+    def register(self, module):
+        self.handle = module.register_forward_hook(self.hook)
+
+class EGEM_Criterion(ABC):
+
+    def __init__(self, stabilizer = 10**-5, sum_spatial = True):
+        self.stabilizer = stabilizer
+        self.sum_spatial = sum_spatial
+
+    @abstractmethod
+    def get_scaling_factors(self, a, r, l):
+        pass
+        
+class EGEM_Relevance_Criterion(EGEM_Criterion):
+
+    def __init__(self, stabilizer = 10**-5, sum_spatial = True):
+        super().__init__(stabilizer, sum_spatial)
+        
+    @override
+    def get_scaling_factors(self, a, r, l):
+        '''
+        Returns PyTorch tensor of scaling factors
+        '''
+
+class EGEM_Refiner:
+    def __init__(self, modules, transform = None, pre_computed = True, criterion = None):
+
+        '''
+        Parameters
+
+        ----------
+        
+        transform: Dictionary of type {torch.nn.Module : Invertible_Transform} 
+
+        '''
+
+        self.transform = transform
+        self.modules = modules
+        self.pre_computed = pre_computed
+
+    def restore_to_orig(self):
+        pass
+
+    def refine(self, A = None, R = None):
+        if self.pre_computed and (A,R) == (None, None):
+            raise ValueError(f"precomputed values need to be provided with arguments A and, optionally, argument R")
+        
+        for mod in self.modules:
+            
+
+        
+
 
 class Refined_Module_EGEM(torch.nn.Module):
 
     '''
     A module that acts as a wrapper around a given layer. During
-    the forward pass, input is scaled by pre-computed scaling factors. 
-    Subsequently, the original layer is applied.
+    the forward pass, the original layer is applied. 
+    Subsequently, the output is scaled by pre-computed scaling factors. 
     
     '''
-    def __init__(self, module, scaling, linear = False):
-        super().__init__()
 
-        self.module = module
-
-        if scaling is not None:
-            if not linear:
-                self.scaling = scaling[None, :, None, None]
-            else:
-                self.scaling = scaling
-    
-    def forward(self, X):
-        return self.module(self.scaling * X)
-    
-    def __str__(self):
-        return self.module.__str__()
-
-class Refined_Module_Multitransform(torch.nn.Module):
-    '''
-    A wrapper module that applies the pruning in a space induced by some invertible function. 
-    Multiple transform/scaling operations can be performed during the forward pass. 
-    
-    '''
-    def __init__(self, module, encoders, decoders, means, scalings):
-
-        super().__init__()
+    def __init__(self, module, scaling, transform = None, inverse = None):
         
+        super().__init__()
+
         self.module = module
-        self.encoders = encoders
-        self.decoders = decoders 
-        self.means = means
-        self.scalings = scalings
-        self.name = module.name
+        self.scaling = scaling
+        self.transform = transform
+        self.invserse = inverse
 
-    def forward(self, X):
+    def forward(self, x):
 
-        out = X
+        a = self.module(x)
+        
+        if self.transform is not None:
+            a = self.transform(a)
 
-        for i, enc in enumerate(self.encoders):
+        a = a * self.scaling
 
-            mean = self.means[i]
-            dec = self.decoders[i]
-            scaling = self.scalings[i]
+        if self.inverse is not None:
+            a = self.inverse(a)
 
-            out = enc(out - mean)
-            out = out * scaling
-            out = dec(out) + mean
-
-        return self.module(out)
+        return a   
     
     def __str__(self):
         return self.module.__str__()
     
-def get_encoding(activations, relevance_scores, mode = "pca", linear = False, center = True, standardize = False, eps = 10**-30):
+def get_component_matrix(activations, relevance = None, mode = "pca", center = True, standardize = False, eps = 10**-30):
     
     '''
     This function computes principle (relevant) components
