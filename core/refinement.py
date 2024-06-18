@@ -9,6 +9,7 @@ def get_scaling_factors(E, lmbda):
     return E / (E + lmbda)
 
 class Invertible_Transform(ABC):
+    
     @abstractmethod
     def fit(self, A, R):
         '''Fit transform from activations and relevance scores'''
@@ -78,6 +79,7 @@ class PRCA(Orthogonal_Transform):
 
         self.make_modules(components, self.as_1x1_conv)
         self.finalize_fit()
+        return self
     
 class PCA(Orthogonal_Transform):
 
@@ -130,53 +132,104 @@ class PCA(Orthogonal_Transform):
 
         self.make_modules(components, self.as_1x1_conv)
         self.finalize_fit()
+        return self
 
 class Refinement_Hook:
 
-    def __init__(self, scaling, transform = None, inverse = None):
+    def __init__(self, scaling, transform = None):
 
         self.scaling = scaling
         self.transform = transform
-        self.inverse = inverse
     
     def hook(self, module, input, output):
 
         if self.transform is not None:
-            output = self.transform(output)
+            output = self.transform.encode(output)
 
         output = output * self.scaling
 
-        if self.inverse is not None:
-            output = self.inverse(output)
+        if self.transform is not None:
+            output = self.inverse.decode(output)
 
         return output
 
     def register(self, module):
-        self.handle = module.register_forward_hook(self.hook)
+        handle = module.register_forward_hook(self.hook)
+        return handle    
+
 
 class EGEM_Criterion(ABC):
 
-    def __init__(self, stabilizer = 10**-5, sum_spatial = True):
+    def __init__(self, stabilizer = 10**-5, last_retained_axis = 1, use_stored_mean = True):
+        if last_retained_axis is not None and last_retained_axis < 1:
+            raise ValueError(f"invalid last retained axis ({last_retained_axis}) - must at least retain the 0th axis")
+        
         self.stabilizer = stabilizer
-        self.sum_spatial = sum_spatial
+        self.last_retained_axis = last_retained_axis
+        self.use_stored_mean = use_stored_mean
 
     @abstractmethod
-    def get_scaling_factors(self, a, r, l):
+    def get_criterion(self, a, r, transform):
         pass
-        
-class EGEM_Relevance_Criterion(EGEM_Criterion):
 
-    def __init__(self, stabilizer = 10**-5, sum_spatial = True):
-        super().__init__(stabilizer, sum_spatial)
+    def get_scaling_factors(self, a, r, l, transform = None):
         
+        if self.used_stored_mean and hasattr(self, "stored_mean"):
+            mean = self.stored_mean
+
+        else:
+            c = self.get_criterion(a, r, transform)
+
+            num_axes = len(c.shape)
+            reduced_axes = list(range(num_axes))[self.last_retained_axis + 1:]
+
+            if self.sum_spatial:
+                c = c.sum(axis = reduced_axes, keepdims = True)
+            
+            mean = (c ** 2).mean(axis = 1, keepdims = True) 
+            
+        s = mean / (mean + l + self.stabilizer)
+        
+        if not isinstance(s, torch.Tensor):
+            s = torch.Tensor(s).float()
+
+        return s
+
+class EGEM_Activation(EGEM_Criterion):
+    
     @override
-    def get_scaling_factors(self, a, r, l):
-        '''
-        Returns PyTorch tensor of scaling factors
-        '''
+    def get_criterion(self, act, rel, transform):
+        if transform is not None:
+            return transform.encoder(act).detach()
+        else:
+            return act        
+          
+class EGEM_Relevance(EGEM_Criterion):
 
+    @override
+    def get_criterion(self, a, r, transform):
+        if transform is not None:
+            
+            h = transform(a).detach()
+            h.requires_grad = True
+
+            rule = zennit.rules.Epsilon()
+            handle = rule.register(transform.decoder)
+
+            d = transform.decoder(h)
+                
+            r_h, = torch.autograd.grad(d, h, grad_outputs=r)
+                
+            handle.remove()
+            r_h = r_h.detach()
+
+            return r_h
+
+        else:
+            return r
+    
 class EGEM_Refiner:
-    def __init__(self, modules, transform = None, pre_computed = True, criterion = None):
+    def __init__(self, modules, val_loader, transform = None, pre_computed = True, criterion = None):
 
         '''
         Parameters
@@ -190,19 +243,34 @@ class EGEM_Refiner:
         self.transform = transform
         self.modules = modules
         self.pre_computed = pre_computed
+        self.criterion = criterion
+        self.val_loader = val_loader
 
     def restore_to_orig(self):
         pass
 
-    def refine(self, A = None, R = None):
+    def refine(self, l, A = None, R = None):
+
         if self.pre_computed and (A,R) == (None, None):
             raise ValueError(f"precomputed values need to be provided with arguments A and, optionally, argument R")
         
-        for mod in self.modules:
-            
+        handles = []
 
-        
+        for i, mod in enumerate(self.modules.keys()):
 
+            a = A[mod]
+            r = R[mod]
+
+            t = self.transform[mod]
+
+            if t is not None and not t.is_fitted:
+                t = t.fit(a, r)
+
+            s = self.criterion[mod](a, r, l / 2**i, transform = t)
+            hook = Refinement_Hook(s, transform = t)
+            handles += [hook.register(mod)]
+
+        return handles
 
 class Refined_Module_EGEM(torch.nn.Module):
 
