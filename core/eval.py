@@ -4,10 +4,9 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as VF
 import torchvision
 
-def make_spurious_mnist(corruptions, poison_fracs, mnist_path, normalize = True):
+def make_spurious_mnist(mnist_path, corruptions, poison_fracs, normalize = True):
 
-    train = torchvision.datasets.MNIST(mnist_path, train = True, download = False, transform = None)
-    train = Poisoned_MNIST_Train(train, corruptions, poison_fracs)
+    train = Poisoned_MNIST_Train(mnist_path, corruptions, poison_fracs)
     
     if normalize:
         train.obtain_mean_stdev()
@@ -17,7 +16,7 @@ def make_spurious_mnist(corruptions, poison_fracs, mnist_path, normalize = True)
 
     if normalize:
         val.mean = train.mean.clone().detach()
-        val.std = train.std.clone().detach()
+        val.stdev = train.stdev.clone().detach()
 
     return train, val
 
@@ -27,6 +26,7 @@ class Poisoned_MNIST_Val(Dataset):
         self.dataset = mnist_dataset
         self.corruptions = corruptions
         sample = np.random.choice(len(self.dataset), size = int(fraction * len(self.dataset)), replace=False)
+
         self.poison_indices = sample
         self.active_corruptions = {cor for cor in self.corruptions}
 
@@ -58,11 +58,12 @@ class Poisoned_MNIST_Val(Dataset):
 
 class Poisoned_MNIST_Train(Dataset):
         
-    def __init__(self, mnist_dataset, corruptions, poison_fracs):
-
-        self.dataset = mnist_dataset
+    def __init__(self, mnist_path, corruptions, poison_fracs):
+        
+        self.dataset = torchvision.datasets.MNIST(mnist_path, train = True, download = False, transform = None)
+        self.mnist_path = mnist_path
         self.poison_indices = {}
-        self.corruptions = {}
+        self.corruptions = corruptions
 
         for label, _ in corruptions.items():
             valid_indices = torch.argwhere(self.dataset.targets == label)
@@ -85,10 +86,42 @@ class Poisoned_MNIST_Train(Dataset):
 
         return X, y
     
+    def get_clean_subset(self, n_classwise):
+        
+        indices = []
+        
+        for label in range(10):
+            valid = torch.argwhere(self.dataset.targets == label)
+            if label in self.corruptions.keys():
+                valid = np.setdiff1d(valid, self.poison_indices[label])
+                
+            sample = np.random.choice(len(valid), size = n_classwise, replace = False)
+            indices += [sample]
+
+        indices = np.concatenate(indices)
+
+        clean_targets = self.dataset.targets[indices]
+        clean_samples = self.dataset.data[indices]
+        transforms = [torchvision.transforms.ToTensor]
+        
+        if hasattr(self, "mean") and hasattr(self, "std"):
+            transforms += [torchvision.transforms.Normalize((self.mean),(self.stdev))]
+
+        mnist = torchvision.datasets.MNIST(self.mnist_path,
+                                            train = True,
+                                            download = False,
+                                            transform = torchvision.transforms.Compose(transforms)
+                                            )
+        
+        mnist.targets = clean_targets
+        mnist.data = clean_samples
+
+        return mnist 
+    
     # TODO: Make this batched
     def obtain_mean_stdev(self):
         loader = DataLoader(self, batch_size=len(self))
-        data = next(iter(loader))
+        data, _ = next(iter(loader))
 
         self.mean = data.mean()
         self.stdev = data.std()
